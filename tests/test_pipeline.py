@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -34,9 +35,46 @@ def page(number, paras, source="ocr", height=792.0):
 
 # ---------------------------------------------------------------- structure reconstruction
 
-def test_soft_wraps_are_joined_and_hyphenation_undone():
-    assert app.join_lines(["a well-", "known fact that", "is co-", "Operative"]) == \
-        "a wellknown fact that is co- Operative"
+def test_soft_wraps_are_joined_and_compounds_keep_their_hyphen():
+    assert app.join_lines(["a well-", "known fact that", "is state-of-the-", "art"]) == \
+        "a well-known fact that is state-of-the-art"
+
+
+# ---------------------------------------------------------------- fix 1: line-end hyphens
+
+@pytest.mark.parametrize("lines, expected", [
+    (["T-", "cell"], "T-cell"),
+    (["beta-", "blocker"], "beta-blocker"),
+    (["CD4-", "positive"], "CD4-positive"),
+    (["informa-", "tion"], "information"),
+    (["quantita-", "tive"], "quantitative"),
+    (["The (Informa-", "tion) age"], "The (Information) age"),  # punctuation stripped for lookup, case kept
+    (["soft\u00ad", "ware"], "software"),
+    (["xylo\u00ad", "phonequux"], "xylophonequux"),  # soft hyphen merges even for unknown words
+    (["costs rose -", "sharply"], "costs rose - sharply"),  # a free-standing dash is not a hyphen
+])
+def test_line_end_hyphens(lines, expected):
+    assert app.join_lines(lines) == expected
+
+
+def test_wordlist_file_is_used_when_present(monkeypatch, tmp_path):
+    wordlist = tmp_path / "words"
+    wordlist.write_text("Zymurgy\nfoo-bar\nfoobar\n", encoding="utf-8")
+    monkeypatch.setattr(app, "WORDLIST_PATH", str(wordlist))
+    assert app.dictionary()[1] == str(wordlist)
+    assert app.join_lines(["zymur-", "gy"]) == "zymurgy"
+    assert app.join_lines(["foo-", "bar"]) == "foo-bar"  # hyphenated form is itself listed -> keep it
+    assert app.join_lines(["informa-", "tion"]) == "informa-tion"  # not in this list -> preserved
+
+
+def test_missing_wordlist_falls_back_to_builtin_list(monkeypatch, tmp_path):
+    monkeypatch.setattr(app, "WORDLIST_PATH", str(tmp_path / "does-not-exist"))
+    words, source = app.dictionary()
+    assert source == "built-in fallback list" and words is app.FALLBACK_WORDS
+    assert app.join_lines(["informa-", "tion"]) == "information"
+    assert app.join_lines(["develop-", "ment"]) == "development"
+    assert app.join_lines(["IL-", "6R"]) == "IL-6R"  # unknown term keeps its hyphen
+    assert app.join_lines(["zymur-", "gy"]) == "zymur-gy"
 
 
 def test_headings_are_tiered_by_size():
@@ -173,3 +211,178 @@ def test_cli_writes_both_outputs(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert (out / "scan.md").read_text(encoding="utf-8").startswith("# Annual Operations Review")
     assert (out / "scan_searchable.pdf").stat().st_size > 0
+
+
+# ---------------------------------------------------------------- fix 2: column detection
+
+class FakePlumberPage:
+    """Just enough of a pdfplumber page for text_layer_page."""
+
+    def __init__(self, words, width=612.0, height=792.0):
+        self.width, self.height, self._words = width, height, words
+
+    def extract_words(self, **_):
+        return [dict(w) for w in self._words]
+
+
+def _layout(text, x, width, top=60.0, size=10.0, char_w=5.0):
+    """Wrap text into a column starting at x; returns one list of pdfplumber-style word dicts per line."""
+    lines, cur, cur_x, y = [], [], x, top
+    for word in text.split():
+        w = len(word) * char_w
+        if cur and cur_x + w > x + width:
+            lines.append(cur)
+            cur, cur_x, y = [], x, y + size * 1.2
+        cur.append({"text": word, "x0": cur_x, "x1": cur_x + w, "top": y, "bottom": y + size,
+                    "size": size, "fontname": "Helvetica"})
+        cur_x += w + char_w
+    return lines + [cur]
+
+
+def _across_gutter(left, right):
+    """Word order of a content stream that runs straight across the gutter, row by row."""
+    return [w for i in range(max(len(left), len(right)))
+            for w in (left[i] if i < len(left) else []) + (right[i] if i < len(right) else [])]
+
+
+def _page_text(content):
+    return " ".join(app.join_lines([l.text for l in p.lines]) for p in content.paras)
+
+
+LEFT = ("Alpha cells were cultured for three days under standard conditions and the first column describes "
+        "how every sample was prepared in careful detail including the buffer used for each plate and the")
+RIGHT = ("washing steps that followed. Beta readings were collected on the plate reader and exported for "
+         "review while the second column explains how outliers were removed before the final comparison.")
+
+
+def test_two_columns_are_read_one_after_the_other():
+    words = _across_gutter(_layout(LEFT, 50, 250), _layout(RIGHT, 312, 250))  # 12pt gutter
+    assert len(app._find_gutters(words, 612)) == 1
+    # Column 1 fully, then column 2, with the sentence joined across the gutter.
+    assert _page_text(app.text_layer_page(FakePlumberPage(words), 1)) == f"{LEFT} {RIGHT}"
+
+
+def test_full_width_title_stays_above_the_columns():
+    # A title crossing the gutter; the columns are page-length so the title is a small share of the rows.
+    title = [{"text": t, "x0": 150 + i * 70, "x1": 210 + i * 70, "top": 20, "bottom": 36, "size": 16,
+              "fontname": "Helvetica-Bold"} for i, t in enumerate("A Study Across Both Columns".split())]
+    left, right = " ".join([LEFT] * 4), " ".join([RIGHT] * 4)
+    words = title + _across_gutter(_layout(left, 50, 250), _layout(right, 312, 250))
+    content = app.text_layer_page(FakePlumberPage(words), 1)
+    assert content.paras[0].lines[0].text == "A Study Across Both Columns"
+    assert _page_text(content) == f"A Study Across Both Columns {left} {right}"
+
+
+def test_single_column_page_is_unchanged(monkeypatch):
+    text = ("Ragged single column text. " * 3 + "Lines end at different places, some short. ") * 6
+    words = [w for line_ in _layout(text, 72, 460) for w in line_]
+    assert app._find_gutters(words, 612) == []
+    with_detection = app.text_layer_page(FakePlumberPage(words), 1)
+    monkeypatch.setattr(app, "_find_gutters", lambda *_: [])
+    without = app.text_layer_page(FakePlumberPage(words), 1)
+    assert [[l.text for l in p.lines] for p in with_detection.paras] == \
+        [[l.text for l in p.lines] for p in without.paras]
+
+
+def test_two_column_pdf_with_real_pdfplumber(tmp_path):
+    pytest.importorskip("reportlab")
+    import pdfplumber
+    src = make_samples.make_two_column_pdf(tmp_path / "two_col.pdf")
+    with pdfplumber.open(str(src)) as pdf:
+        text = _page_text(app.text_layer_page(pdf.pages[0], 1))
+    assert text.startswith("A Study of Two Columns Across the Full Page Width ")
+    assert f"{make_samples.TWO_COLUMN_LEFT} {make_samples.TWO_COLUMN_RIGHT}" in text
+
+
+# ---------------------------------------------------------------- fix 3: memory-aware scheduling
+
+class FakeProc:
+    returncode = 0
+
+    def poll(self):
+        return 0
+
+    def kill(self):
+        pass
+
+    def wait(self):
+        pass
+
+
+def _fake_free_memory(monkeypatch, mb):
+    fake = SimpleNamespace(virtual_memory=lambda: SimpleNamespace(available=mb * 2**20))
+    monkeypatch.setattr(app, "psutil", fake)
+
+
+def test_schedule_depends_on_free_memory(monkeypatch):
+    opts = app.Options(min_concurrent_mem_mb=1500)
+    _fake_free_memory(monkeypatch, 800)
+    assert app.choose_schedule(opts)[0] == "sequential"
+    _fake_free_memory(monkeypatch, 4000)
+    assert app.choose_schedule(opts)[0] == "concurrent"
+    assert app.choose_schedule(app.Options(force_sequential=True))[0] == "sequential"
+    monkeypatch.setattr(app, "psutil", None)  # psutil unavailable -> safe default
+    assert app.choose_schedule(opts)[0] == "sequential"
+
+
+@pytest.fixture
+def pipeline_spy(monkeypatch, tmp_path):
+    """Stub the heavy stages of _convert_pdf and record the order in which they run."""
+    events = []
+    monkeypatch.setattr(app, "find_tools", lambda: dict.fromkeys(
+        ("tesseract", "pdftoppm", "ghostscript", "ocrmypdf"), "x"))
+    monkeypatch.setattr(app, "analyze_pdf", lambda *_: app.PdfInfo(1, [(612.0, 792.0)], False, 0))  # image-only
+
+    def extract(*_, workers=None, **__):
+        events.append(("extract_start", workers))
+        events.append("extract_done")
+        return [page(1, [[line("Recovered text.")]])]
+
+    def start(src, dst, opts, jobs, log):
+        events.append(("ocrmypdf_start", jobs))
+        return FakeProc()
+
+    def finish(*_):
+        events.append("ocrmypdf_done")
+        return b"%PDF-fake"
+
+    monkeypatch.setattr(app, "extract_pdf_pages", extract)
+    monkeypatch.setattr(app, "start_ocrmypdf", start)
+    monkeypatch.setattr(app, "finish_ocrmypdf", finish)
+    src = tmp_path / "in.pdf"
+    src.write_bytes(b"%PDF-1.4")
+    return SimpleNamespace(events=events, src=src, workdir=tmp_path)
+
+
+def test_sequential_mode_extracts_before_ocrmypdf(monkeypatch, pipeline_spy):
+    _fake_free_memory(monkeypatch, 500)
+    monkeypatch.setattr(app.os, "cpu_count", lambda: 8)
+    res = app.convert(pipeline_spy.src, pipeline_spy.workdir, app.Options(),
+                      on_markdown=lambda md: pipeline_spy.events.append("markdown_ready"))
+    # Extraction completes (and the Markdown is handed over) before OCRmyPDF starts; each gets all cores.
+    assert pipeline_spy.events == [("extract_start", 8), "extract_done", "markdown_ready",
+                                   ("ocrmypdf_start", 8), "ocrmypdf_done"]
+    assert res.stats["schedule"] == "sequential" and res.pdf_bytes == b"%PDF-fake"
+
+
+def test_concurrent_mode_overlaps_the_stages(monkeypatch, pipeline_spy):
+    _fake_free_memory(monkeypatch, 8000)
+    res = app.convert(pipeline_spy.src, pipeline_spy.workdir, app.Options())
+    assert pipeline_spy.events[:2] == [("ocrmypdf_start", app._worker_split()[1]), ("extract_start", None)]
+    assert res.stats["schedule"] == "concurrent" and res.pdf_bytes == b"%PDF-fake"
+
+
+@pytest.mark.parametrize("failing_stage", ["finish_ocrmypdf", "start_ocrmypdf"])
+def test_ocrmypdf_failure_in_sequential_mode_keeps_the_markdown(monkeypatch, pipeline_spy, failing_stage):
+    _fake_free_memory(monkeypatch, 500)
+
+    def fail(*_):
+        if failing_stage == "finish_ocrmypdf":
+            raise app.PipelineError("OCRmyPDF was killed by the system")
+        raise OSError("cannot allocate memory")
+
+    monkeypatch.setattr(app, failing_stage, fail)
+    res = app.convert(pipeline_spy.src, pipeline_spy.workdir, app.Options())
+    assert res.markdown.strip() == "Recovered text."
+    assert res.pdf_bytes is None
+    assert any("OCRmyPDF" in w for w in res.warnings)

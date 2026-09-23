@@ -11,8 +11,12 @@ Run headless: python app.py input.pdf -o out/
 from __future__ import annotations
 
 import argparse
+import bisect
+import functools
 import glob
 import hashlib
+import logging
+import math
 import os
 import re
 import shutil
@@ -28,13 +32,40 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Callable
 
+try:
+    import psutil
+except ImportError:  # without it free memory is unknown, so we always use the safe sequential schedule
+    psutil = None
+
 # Tesseract uses OpenMP; we parallelise across pages ourselves, so keep each process single-threaded.
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
+log = logging.getLogger("searchable_pdf_maker")
 
 ProgressFn = Callable[[float, str], None]
 
 MAX_PAGE_PIXELS = 60_000_000  # cap render size for very large pages (posters, drawings)
 MIN_TEXT_CHARS_PER_PAGE = 10  # fewer alphanumerics than this on a page => treat the page as image-only
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# Memory-aware scheduling (see choose_schedule). Tesseract and OCRmyPDF are both RAM-heavy; running them
+# side by side on a small host (Streamlit Community Cloud has ~1 GB) gets the container OOM-killed.
+MIN_CONCURRENT_MEM_MB = _env_int("SPM_MIN_CONCURRENT_MEM_MB", 1500)  # free RAM needed to run both at once
+FORCE_SEQUENTIAL = os.environ.get("SPM_FORCE_SEQUENTIAL", "").strip().lower() in ("1", "true", "yes", "on")
+
+# Column detection for text-layer pages (see _find_gutters).
+COLUMN_MIN_GUTTER_WIDTH_FRAC = 0.012  # a gutter is at least this wide, as a fraction of page width (~7pt)
+COLUMN_MIN_GUTTER_HEIGHT_FRAC = 0.75  # ...and free of words in at least this share of the text rows
+COLUMN_MIN_SIDE_WORD_FRAC = 0.15  # every column must hold at least this share of the page's words
+COLUMN_MAX_COLUMNS = 4
+COLUMN_MIN_WORDS = 30  # fewer words than this: too little evidence, treat as a single column
 
 
 class PipelineError(Exception):
@@ -161,6 +192,8 @@ class Options:
     lang: str = "eng"
     heading_ratio: float = 1.5
     make_pdf: bool = True
+    force_sequential: bool = FORCE_SEQUENTIAL
+    min_concurrent_mem_mb: int = MIN_CONCURRENT_MEM_MB
 
 
 @dataclass
@@ -338,14 +371,116 @@ _BOLD_RE = re.compile(r"bold|black|heavy|semibold|demi", re.I)
 def text_layer_page(page, page_no: int) -> PageContent:
     """Extract words from a pdfplumber page and rebuild lines/paragraphs from their geometry."""
     content = PageContent(page_no, float(page.width), float(page.height), "text")
-    words = page.extract_words(use_text_flow=True, keep_blank_chars=False, extra_attrs=["size", "fontname"])
-    lines: list[list[dict]] = []
-    for w in words:
+    words = []
+    for w in page.extract_words(use_text_flow=True, keep_blank_chars=False, extra_attrs=["size", "fontname"]):
         w["text"] = w["text"].translate(_LIGATURES).strip()
         if not w["text"]:
             continue
         if _has_alnum(w["text"]):
             content.word_sizes.append(float(w["size"]))
+        words.append(w)
+
+    # Text flow reads straight across a narrow gutter on two-column pages, interleaving the columns.
+    # So split the page into columns first and group lines within each one, reading every column
+    # top to bottom before moving right. A single-column page is one chunk: behaviour is unchanged.
+    for chunk in _column_chunks(words, content.width):
+        lines = _words_to_lines(chunk)
+        paras = _refine_paragraphs([lines] if lines else [], use_font_changes=True)
+        prev = content.paras[-1] if content.paras else None
+        if prev and paras and not TERMINAL_RE.search(prev.lines[-1].text) and paras[0].lines[0].text[:1].islower():
+            prev.lines.extend(paras.pop(0).lines)  # a sentence that continues at the top of the next column
+        content.paras.extend(paras)
+    return content
+
+
+def _find_gutters(words: list[dict], page_width: float) -> list[tuple[float, float]]:
+    """Vertical whitespace strips that separate text columns, left to right ([] = one column).
+
+    The text area is cut into thin horizontal slices; an x position is a gutter candidate if no word
+    covers it in at least COLUMN_MIN_GUTTER_HEIGHT_FRAC of the slices that contain text, so a title
+    spanning both columns doesn't hide the gutter. Candidates must be interior, wide enough, and leave
+    a meaningful share of words in every column, which rules out word gaps and ragged right edges.
+    """
+    if len(words) < COLUMN_MIN_WORDS or COLUMN_MAX_COLUMNS < 2:
+        return []
+    x_min, x_max = min(w["x0"] for w in words), max(w["x1"] for w in words)
+    y_min = min(w["top"] for w in words)
+    slice_h = max(_median([w["bottom"] - w["top"] for w in words]) / 2, 1.0)
+    n_bins = int(math.ceil(x_max - x_min)) + 1  # 1pt bins
+    rows: dict[int, bytearray] = {}
+    for w in words:
+        b0, b1 = int(w["x0"] - x_min), int(math.ceil(w["x1"] - x_min))
+        for s in range(int((w["top"] - y_min) / slice_h), int((w["bottom"] - y_min) / slice_h) + 1):
+            rows.setdefault(s, bytearray(n_bins))[b0:b1] = b"\x01" * (b1 - b0)
+    blocked = [sum(col) for col in zip(*rows.values())]
+    max_blocked = (1 - COLUMN_MIN_GUTTER_HEIGHT_FRAC) * len(rows)
+
+    gutters, start = [], None
+    for b, n in enumerate(blocked + [len(rows) + 1]):  # sentinel closes a trailing run
+        if n <= max_blocked:
+            start = b if start is None else start
+        elif start is not None:
+            # Runs touching either edge are margins/ragged edges, not gutters.
+            if start > 0 and b < n_bins and b - start >= COLUMN_MIN_GUTTER_WIDTH_FRAC * page_width:
+                gutters.append((x_min + start, x_min + b))
+            start = None
+    gutters = sorted(sorted(gutters, key=lambda g: g[0] - g[1])[:COLUMN_MAX_COLUMNS - 1])
+
+    # Drop gutters until every column holds enough words (guards against false splits).
+    while gutters:
+        mids = [(a + b) / 2 for a, b in gutters]
+        counts = [0] * (len(gutters) + 1)
+        for w in words:
+            counts[bisect.bisect(mids, (w["x0"] + w["x1"]) / 2)] += 1
+        thinnest = min(range(len(counts)), key=counts.__getitem__)
+        if counts[thinnest] >= COLUMN_MIN_SIDE_WORD_FRAC * len(words):
+            break
+        gutters.pop(min(thinnest, len(gutters) - 1))
+    return gutters
+
+
+def _column_chunks(words: list[dict], page_width: float) -> list[list[dict]]:
+    """Split words into reading-order chunks: each column fully, left to right.
+
+    Rows containing a word that crosses a gutter (a title or caption spanning the page) become their
+    own full-width chunk and divide the page into sections, whose columns are read separately. Words
+    keep their original relative order inside each chunk.
+    """
+    gutters = _find_gutters(words, page_width)
+    if not gutters:
+        return [words]
+    mids = [(a + b) / 2 for a, b in gutters]
+    bands: list[list[float]] = []  # merged y-ranges of full-width rows
+    for w in sorted((w for w in words if any(w["x0"] < b and w["x1"] > a for a, b in gutters)),
+                    key=lambda w: w["top"]):
+        if bands and w["top"] <= bands[-1][1]:
+            bands[-1][1] = max(bands[-1][1], w["bottom"])
+        else:
+            bands.append([w["top"], w["bottom"]])
+
+    sections = [[[] for _ in range(len(gutters) + 1)] for _ in range(len(bands) + 1)]
+    band_words: list[list[dict]] = [[] for _ in bands]
+    for w in words:
+        cy = (w["top"] + w["bottom"]) / 2
+        band = next((i for i, (top, bottom) in enumerate(bands) if top <= cy <= bottom), None)
+        if band is not None:
+            band_words[band].append(w)
+        else:
+            above = sum(1 for _, bottom in bands if bottom < cy)
+            sections[above][bisect.bisect(mids, (w["x0"] + w["x1"]) / 2)].append(w)
+
+    chunks = []
+    for i, columns in enumerate(sections):
+        chunks.extend(columns)
+        if i < len(bands):
+            chunks.append(band_words[i])
+    return [c for c in chunks if c]
+
+
+def _words_to_lines(words: list[dict]) -> list[Line]:
+    """Group words (in reading order) into lines by vertical overlap and left-to-right progress."""
+    lines: list[list[dict]] = []
+    for w in words:
         if lines:
             prev = lines[-1][-1]
             h = min(prev["bottom"] - prev["top"], w["bottom"] - w["top"]) or 1.0
@@ -355,7 +490,7 @@ def text_layer_page(page, page_no: int) -> PageContent:
                 continue
         lines.append([w])
 
-    built = [
+    return [
         Line(
             text=" ".join(w["text"] for w in ws),
             size=_median([float(w["size"]) for w in ws]),
@@ -366,9 +501,6 @@ def text_layer_page(page, page_no: int) -> PageContent:
         )
         for ws in lines
     ]
-    # A text layer has no paragraph info, so start from one group per page and split it.
-    content.paras = _refine_paragraphs([built] if built else [], use_font_changes=True)
-    return content
 
 
 def _refine_paragraphs(groups: list[list[Line]], use_font_changes: bool) -> list[Para]:
@@ -512,8 +644,95 @@ def _clean_page(page: PageContent) -> None:
     page.paras = merged
 
 
+WORDLIST_PATH = "/usr/share/dict/words"
+
+# Used only when WORDLIST_PATH is missing (Windows/macOS without it, or no `wamerican` package): common
+# words that often get hyphenated at a line break. Anything not listed keeps its hyphen - the safe default.
+FALLBACK_WORDS = frozenset("""
+about above absolute according account achieve achievement across activity actually addition additional
+address administration advantage against agreement algorithm alternative although analysis analytical
+another anything application applications approach appropriate approximately architecture argument
+around article assessment assistance associated association assumption attention available average
+background because become before behavior behaviour believe benefit between beyond building business
+calculation capability capacity category certain challenge change character characteristic chemical
+children clinical collection combination commercial committee common communication community company
+comparison complete component components computer concentration concept condition conditions conference
+configuration consequence consider considerable consideration consistent constant construction content
+context continue contribution control conventional coordination corresponding country current currently
+customer database decision definition delivery demonstrate department dependent describe description
+design determine development difference different difficult dimension direction discussion distribution
+document during economic education effective efficiency effort element emergency employee employment
+encourage energy engineering environment environmental equipment especially establish estimate
+evaluation everything evidence example excellent exchange existing experience experiment experimental
+explanation expression facilities facility factor following foundation framework frequency function
+functional fundamental further general generally government graduate greater growth guidance hardware
+health however hypothesis identification identify implementation importance important improvement
+include including increase increased independent indicate individual industrial industry influence
+information infrastructure initial institution instruction instrument insurance integration
+intelligence interest interesting international interpretation intervention introduction investigation
+investment involved knowledge laboratory language learning legislation literature location machine
+maintenance management manufacturing material materials mathematical measurement mechanism medical
+medicine member membership message method methodology minister minimum moreover movement multiple
+national natural necessary negative network nevertheless normally nothing number objective observation
+obtained occupation operation operational opinion opportunity optimization organisation organization
+original outcome output overall participant participants particular particularly partnership patient
+patients people percentage performance period permanent personal perspective phenomenon physical
+planning political population position positive possibility possible potential practical practice
+precisely preparation presence presentation president pressure prevention previous previously primary
+principle priority probability problem procedure procurement process processing produce product
+production productivity professional profile program programme progress project property proportion
+proposal protection provide provided provision publication purpose qualitative quality quantitative
+quantity question reasonable recommendation reduction reference regarding regional registration
+regulation relationship relative relatively relevant replacement report representation representative
+requirement requirements research resource resources response responsibility responsible restaurant
+result results revenue schedule scheduled science scientific secretary section security selection
+separate sequence service services significance significant significantly similar simulation situation
+software solution something specific specifically standard statement statistical statistics strategy
+strength structure student students subsequent substantial success successful sufficient suggest
+summary supplement support surface survey system systems technical technique technology temperature
+therefore thousand throughout together tradition traditional training transaction transformation
+transition transport transportation treatment understanding university unfortunately variable variation
+various vehicle version whatever whether without working
+""".split())
+
+
+@functools.lru_cache(maxsize=None)
+def _load_wordlist(path: str) -> tuple[frozenset[str], str]:
+    """Read a one-word-per-line list into a lowercase set (cached per path), else use the fallback."""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            words = frozenset(w.strip().lower() for w in fh if w.strip())
+        if words:
+            return words, path
+    except OSError:
+        pass
+    return FALLBACK_WORDS, "built-in fallback list"
+
+
+def dictionary() -> tuple[frozenset[str], str]:
+    """(set of known words, where it came from). Read once; later calls hit the cache."""
+    return _load_wordlist(WORDLIST_PATH)
+
+
+dictionary()  # load at startup rather than on the first line break
+
+_EDGE_PUNCT_RE = re.compile(r"^\W+|\W+$")
+
+
+def _is_wrapped_word(before: str, after: str) -> bool:
+    """Should a line-end hyphen-minus between `before` and `after` be dropped?
+
+    Only when the joined form is a dictionary word and the hyphenated form is not ("informa-" +
+    "tion"). Real compounds and domain terms ("T-cell", "CD4-positive") are not in the dictionary,
+    so they keep the hyphen: leaving a stray hyphen is better than corrupting a term.
+    """
+    words, _ = dictionary()
+    a, b = _EDGE_PUNCT_RE.sub("", before).lower(), _EDGE_PUNCT_RE.sub("", after).lower()
+    return bool(a and b) and a + b in words and f"{a}-{b}" not in words
+
+
 def join_lines(texts: list[str]) -> str:
-    """Undo soft wraps: join lines with spaces, re-joining words hyphenated across a line break."""
+    """Undo soft wraps: join lines with spaces and resolve hyphens left at a line break."""
     out = ""
     for t in texts:
         t = t.strip()
@@ -521,8 +740,13 @@ def join_lines(texts: list[str]) -> str:
             continue
         if not out:
             out = t
-        elif re.search(r"[^\W\d_][-\u00ad]$", out) and t[0].islower():
-            out = out[:-1] + t
+        elif out.endswith("\u00ad"):
+            out = out[:-1] + t  # soft hyphen: always a line-break artefact, never part of the word
+        elif out.endswith("-") and len(out) > 1 and not out[-2].isspace() and _has_alnum(out[:-1].split()[-1]):
+            # Hyphen-minus after a word: a wrapped word ("informa-tion") or a real hyphen ("T-cell")?
+            # Ask the dictionary; either way the two halves are joined without a space.
+            before, after = out[:-1].split()[-1], t.split()[0]
+            out = out[:-1] + t if _is_wrapped_word(before, after) else out + t
         else:
             out += " " + t
     return out
@@ -889,6 +1113,9 @@ def finish_ocrmypdf(proc: subprocess.Popen, dst: Path, log: Path, progress: Prog
         proc.stderr.close()
     if proc.returncode in (0, 10) and dst.exists():
         return dst.read_bytes()
+    if proc.returncode < 0 or proc.returncode == 137:  # SIGKILL: almost always the out-of-memory killer
+        raise PipelineError("OCRmyPDF was killed by the system, most likely because it ran out of memory. "
+                            "Turn on 'Force sequential mode' or lower the OCR DPI.")
     reason = OCRMYPDF_EXIT.get(proc.returncode, f"exit code {proc.returncode}")
     tail = log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-6:] if log.exists() else []
     raise PipelineError(f"OCRmyPDF failed: {reason}.\n" + "\n".join(tail))
@@ -908,8 +1135,29 @@ def _worker_split() -> tuple[int, int]:
     return max(1, cpus - ocrmypdf_jobs), ocrmypdf_jobs
 
 
+def choose_schedule(opts: Options) -> tuple[str, str]:
+    """Decide whether Tesseract (Markdown) and OCRmyPDF (PDF) may run at the same time.
+
+    Returns ("concurrent" | "sequential", reason). Concurrent only when psutil reports at least
+    opts.min_concurrent_mem_mb of free RAM; anything uncertain falls back to the safe sequential mode.
+    """
+    if opts.force_sequential:
+        return "sequential", "forced by setting"
+    if psutil is None:
+        return "sequential", "psutil is not installed, so free memory is unknown"
+    try:
+        available_mb = psutil.virtual_memory().available / 2**20
+    except Exception:
+        return "sequential", "free memory could not be read"
+    if available_mb >= opts.min_concurrent_mem_mb:
+        return "concurrent", f"{available_mb:,.0f} MB free (threshold {opts.min_concurrent_mem_mb:,} MB)"
+    return "sequential", f"only {available_mb:,.0f} MB free (threshold {opts.min_concurrent_mem_mb:,} MB)"
+
+
 def extract_pdf_pages(src: Path, info: PdfInfo, opts: Options, tools: dict, progress: ProgressFn,
-                      warnings: list[str], span: tuple[float, float] = (0.0, 0.9)) -> list[PageContent]:
+                      warnings: list[str], span: tuple[float, float] = (0.0, 0.9),
+                      workers: int | None = None) -> list[PageContent]:
+    """Text layer / OCR for every page. `workers` = OCR threads (default: our share of _worker_split)."""
     lo, hi = span
     pages: dict[int, PageContent] = {}
     to_ocr: list[int] = []
@@ -945,7 +1193,7 @@ def extract_pdf_pages(src: Path, info: PdfInfo, opts: Options, tools: dict, prog
             to_ocr = []
 
     if to_ocr:
-        workers, _ = _worker_split()
+        workers = workers or _worker_split()[0]
         done = 0
         progress(lo, f"OCR: rendering at {opts.dpi} DPI and recognising page 1 of {len(to_ocr)}…")
         with ThreadPoolExecutor(max_workers=min(workers, len(to_ocr))) as pool:
@@ -968,12 +1216,17 @@ def extract_pdf_pages(src: Path, info: PdfInfo, opts: Options, tools: dict, prog
     return [pages[n] for n in sorted(pages)]
 
 
-def convert(src: Path, workdir: Path, opts: Options, progress: ProgressFn = _noop) -> Result:
-    """Convert a PDF/DOCX/DOC into Markdown + searchable PDF."""
+def convert(src: Path, workdir: Path, opts: Options, progress: ProgressFn = _noop,
+            on_markdown: Callable[[str], None] | None = None) -> Result:
+    """Convert a PDF/DOCX/DOC into Markdown + searchable PDF.
+
+    `on_markdown` (PDF input) is called with the finished Markdown before the searchable-PDF stage is
+    awaited, so a caller can keep it even if that last stage dies.
+    """
     t0 = time.time()
     ext = src.suffix.lower()
     if ext == ".pdf":
-        result = _convert_pdf(src, workdir, opts, progress)
+        result = _convert_pdf(src, workdir, opts, progress, on_markdown)
     elif ext in (".docx", ".doc"):
         result = _convert_word(src, workdir, opts, progress)
     else:
@@ -983,8 +1236,12 @@ def convert(src: Path, workdir: Path, opts: Options, progress: ProgressFn = _noo
     return result
 
 
-def _make_searchable(pdf: Path, workdir: Path, opts: Options, tools: dict, warnings: list[str]):
-    """Start OCRmyPDF in the background; returns (proc, output, log) or None."""
+def _make_searchable(pdf: Path, workdir: Path, opts: Options, tools: dict, warnings: list[str],
+                     jobs: int | None = None):
+    """Start OCRmyPDF in the background; returns (proc, output, log) or None.
+
+    `jobs` = OCRmyPDF worker processes (default: its share of _worker_split).
+    """
     if not opts.make_pdf:
         return None
     missing = [t for t in ("ocrmypdf", "tesseract", "ghostscript") if not tools.get(t)]
@@ -992,8 +1249,11 @@ def _make_searchable(pdf: Path, workdir: Path, opts: Options, tools: dict, warni
         warnings.append("Searchable PDF not created: " + " ".join(TOOL_HINTS[t] for t in missing))
         return None
     dst, log = workdir / "searchable.pdf", workdir / "ocrmypdf.log"
-    _, jobs = _worker_split()
-    return start_ocrmypdf(pdf, dst, opts, jobs, log), dst, log
+    try:
+        return start_ocrmypdf(pdf, dst, opts, jobs or _worker_split()[1], log), dst, log
+    except Exception as exc:  # e.g. OSError/MemoryError when forking: lose the PDF, never the Markdown
+        warnings.append(f"Searchable PDF not created: OCRmyPDF could not be started ({exc}).")
+        return None
 
 
 def _collect_pdf(job, fallback: Path | None, progress: ProgressFn, start: float, warnings: list[str]):
@@ -1002,11 +1262,12 @@ def _collect_pdf(job, fallback: Path | None, progress: ProgressFn, start: float,
     proc, dst, log = job
     try:
         return finish_ocrmypdf(proc, dst, log, progress, start)
-    except PipelineError as exc:
+    except Exception as exc:  # any PDF-stage failure becomes a warning; the Markdown is already done
+        msg = str(exc) if isinstance(exc, PipelineError) else f"OCRmyPDF failed: {exc}"
         if fallback:
-            warnings.append(f"{exc}\nFalling back to a PDF that already has a text layer.")
+            warnings.append(f"{msg}\nFalling back to a PDF that already has a text layer.")
             return fallback.read_bytes()
-        warnings.append(str(exc))
+        warnings.append(msg)
         return None
 
 
@@ -1016,7 +1277,8 @@ def _kill(job) -> None:
         job[0].wait()
 
 
-def _convert_pdf(src: Path, workdir: Path, opts: Options, progress: ProgressFn) -> Result:
+def _convert_pdf(src: Path, workdir: Path, opts: Options, progress: ProgressFn,
+                 on_markdown: Callable[[str], None] | None = None) -> Result:
     tools = find_tools()
     warnings: list[str] = []
     progress(0.01, "Inspecting PDF…")
@@ -1027,16 +1289,40 @@ def _convert_pdf(src: Path, workdir: Path, opts: Options, progress: ProgressFn) 
         if missing:
             raise PipelineError("This PDF needs OCR but it can't run: " + " ".join(TOOL_HINTS[t] for t in missing))
 
-    job = _make_searchable(src, workdir, opts, tools, warnings)
-    try:
-        pages = extract_pdf_pages(src, info, opts, tools, progress, warnings)
-        progress(0.9, "Reconstructing Markdown structure…")
-        markdown = build_markdown(pages, opts.heading_ratio)
-        # A PDF that already had text is itself searchable, so it is an acceptable fallback.
-        fallback = src if opts.make_pdf and not info.image_only else None
-        pdf_bytes = _collect_pdf(job, fallback, progress, 0.92, warnings)
-    finally:
-        _kill(job)
+    # A PDF that already had text is itself searchable, so it is an acceptable fallback.
+    fallback = src if opts.make_pdf and not info.image_only else None
+    mode, reason = choose_schedule(opts)
+    log.info("Schedule: %s (%s)", mode, reason)
+    progress(0.02, f"Schedule: {mode} ({reason})")
+
+    def markdown_stage(span: tuple[float, float], workers: int | None) -> tuple[list[PageContent], str]:
+        pages = extract_pdf_pages(src, info, opts, tools, progress, warnings, span=span, workers=workers)
+        progress(span[1], "Reconstructing Markdown structure…")
+        md = build_markdown(pages, opts.heading_ratio)
+        if on_markdown:
+            on_markdown(md)
+        return pages, md
+
+    if mode == "concurrent":
+        # Plenty of RAM: OCRmyPDF builds the PDF in the background while we extract; cores are shared.
+        job = _make_searchable(src, workdir, opts, tools, warnings)
+        try:
+            pages, markdown = markdown_stage((0.0, 0.9), None)
+            pdf_bytes = _collect_pdf(job, fallback, progress, 0.92, warnings)
+        finally:
+            _kill(job)
+    else:
+        # Low RAM: one heavy stage at a time, each with every core. Markdown extraction ALWAYS runs
+        # first and to completion: it is the core output of the app, so if OCRmyPDF then exhausts memory
+        # and is killed at the very end, the user still has the finished Markdown. Never start OCRmyPDF
+        # before this point in sequential mode.
+        cpus = os.cpu_count() or 1
+        pages, markdown = markdown_stage((0.0, 0.5 if opts.make_pdf else 0.9), cpus)
+        job = _make_searchable(src, workdir, opts, tools, warnings, jobs=cpus)
+        try:
+            pdf_bytes = _collect_pdf(job, fallback, progress, 0.55, warnings)
+        finally:
+            _kill(job)
 
     ocr_pages = [p for p in pages if p.source == "ocr"]
     confs = [p.conf for p in ocr_pages if p.conf is not None]
@@ -1047,6 +1333,7 @@ def _convert_pdf(src: Path, workdir: Path, opts: Options, progress: ProgressFn) 
         "text layer": "none (image-only)" if info.image_only else "present",
         "OCR pages": len(ocr_pages),
         "mean OCR confidence": round(sum(confs) / len(confs), 1) if confs else None,
+        "schedule": mode,
     })
 
 
@@ -1128,14 +1415,29 @@ def main() -> None:
                                 help="Tesseract language packs installed on this machine.")
         heading_ratio = st.slider("Heading size threshold (× body text)", 1.2, 2.5, 1.5, 0.05,
                                   help="Lines this much taller than the median body text become headings.")
+        st.subheader("Memory")
+        force_sequential = st.toggle(
+            "Force sequential mode", value=FORCE_SEQUENTIAL,
+            help="Build the Markdown first, then the searchable PDF, one at a time. Recommended on "
+                 "low-RAM hosts such as Streamlit Community Cloud (env: SPM_FORCE_SEQUENTIAL=1).")
+        min_mem = st.number_input(
+            "Min free RAM for concurrent mode (MB)", min_value=256, max_value=262_144,
+            value=MIN_CONCURRENT_MEM_MB, step=256,
+            help="Below this much free memory the two OCR stages run one after the other "
+                 "(env: SPM_MIN_CONCURRENT_MEM_MB).")
+        mode, reason = choose_schedule(Options(force_sequential=force_sequential,
+                                               min_concurrent_mem_mb=int(min_mem)))
+        st.caption(f"Mode now: **{mode}** ({reason})")
         with st.expander("System check"):
             for name, path in tools.items():
                 st.markdown(f"{'✅' if path else '❌'} **{name}**" + (f"  \n`{path}`" if path else ""))
             if not langs:
                 st.caption("Could not list Tesseract languages.")
+            st.markdown(f"Hyphenation dictionary: `{dictionary()[1]}`")
 
     opts = Options(dpi=int(dpi), force_ocr=force_ocr, lang="+".join(chosen) or "eng",
-                   heading_ratio=float(heading_ratio))
+                   heading_ratio=float(heading_ratio), force_sequential=force_sequential,
+                   min_concurrent_mem_mb=int(min_mem))
 
     uploaded = st.file_uploader("Upload a document", type=["pdf", "docx", "doc"])
     if uploaded is None:
@@ -1143,7 +1445,8 @@ def main() -> None:
         return
 
     data = uploaded.getvalue()
-    key = f"{hashlib.sha256(data).hexdigest()}|{opts}"
+    # Scheduling settings change how the work runs, not its output, so they're not part of the key.
+    key = f"{hashlib.sha256(data).hexdigest()}|{(opts.dpi, opts.force_ocr, opts.lang, opts.heading_ratio)}"
     name = _safe_name(uploaded.name)
     stem = Path(name).stem
     cached = st.session_state.get("result")
@@ -1161,9 +1464,14 @@ def main() -> None:
                 last[0] = now
                 bar.progress(max(0.0, min(frac, 1.0)), text=msg)
 
+        def keep_markdown(md: str) -> None:
+            # Checkpoint: if the searchable-PDF stage dies or the run is interrupted, the Markdown survives.
+            st.session_state["result"] = (key, Result(md, None, [
+                "The searchable PDF did not finish; only the Markdown is available."]))
+
         try:
             with st.spinner(f"Processing {uploaded.name}…"):
-                result = convert(src, workdir, opts, progress)
+                result = convert(src, workdir, opts, progress, keep_markdown)
             st.session_state["result"] = (key, result)
             cached = st.session_state["result"]
         except PipelineError as exc:
@@ -1230,9 +1538,14 @@ def cli(argv: list[str]) -> int:
     ap.add_argument("--force-ocr", action="store_true")
     ap.add_argument("--heading-ratio", type=float, default=1.5)
     ap.add_argument("--no-pdf", action="store_true", help="only produce the Markdown")
+    ap.add_argument("--sequential", action="store_true", default=FORCE_SEQUENTIAL,
+                    help="never run Tesseract and OCRmyPDF at the same time (low-RAM hosts)")
+    ap.add_argument("--min-concurrent-mem-mb", type=int, default=MIN_CONCURRENT_MEM_MB,
+                    help="free RAM needed to run both OCR stages at once (default %(default)s)")
     args = ap.parse_args(argv)
 
-    opts = Options(args.dpi, args.force_ocr, args.lang, args.heading_ratio, not args.no_pdf)
+    opts = Options(args.dpi, args.force_ocr, args.lang, args.heading_ratio, not args.no_pdf,
+                   args.sequential, args.min_concurrent_mem_mb)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     workdir = Path(tempfile.mkdtemp(prefix="spm_"))
     try:

@@ -154,6 +154,58 @@ def make_text_pdf(path: Path) -> Path:
     return path
 
 
+TWO_COLUMN_LEFT = ("Alpha cells were cultured for three days under standard conditions. The first column "
+                   "describes the preparation of every sample in careful detail, including the buffer and "
+                   "the incubation time used for each plate. Samples that failed the quality check were "
+                   "discarded before any measurement was taken and the remaining plates were stored at four "
+                   "degrees until the")
+TWO_COLUMN_RIGHT = ("analysis began on the following morning. Beta measurements were then collected with the "
+                    "plate reader and exported for statistical review. The second column reports how the "
+                    "readings were normalised and which outliers were removed from the final data set before "
+                    "the comparison between groups was made.")
+
+
+def make_two_column_pdf(path: Path) -> Path:
+    """A dense two-column page with a narrow (12pt) gutter, written row by row across both columns.
+
+    Writing each left line immediately followed by the right line at the same height mimics PDFs whose
+    content stream runs across the gutter, which is what makes naive text flow interleave the columns.
+    Requires reportlab.
+    """
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.pdfgen import canvas
+
+    size, left_x, col_w, gutter = 10, 50, 250, 12
+    right_x = left_x + col_w + gutter
+
+    def wrap(text):
+        lines, cur = [], ""
+        for word in text.split():
+            trial = f"{cur} {word}".strip()
+            if stringWidth(trial, "Helvetica", size) <= col_w:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = word
+        return lines + [cur]
+
+    c = canvas.Canvas(str(path), pagesize=letter)
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(left_x, 740, "A Study of Two Columns Across the Full Page Width")
+    c.setFont("Helvetica", size)
+    left, right = wrap(TWO_COLUMN_LEFT), wrap(TWO_COLUMN_RIGHT)
+    for i in range(max(len(left), len(right))):
+        y = 710 - i * size * 1.2
+        if i < len(left):
+            c.drawString(left_x, y, left[i])
+        if i < len(right):
+            c.drawString(right_x, y, right[i])
+    c.showPage()
+    c.save()
+    return path
+
+
 def make_docx(path: Path) -> Path:
     import docx
     doc = docx.Document()
@@ -184,5 +236,6 @@ if __name__ == "__main__":
     print(make_docx(out / "sample.docx"))
     try:
         print(make_text_pdf(out / "sample_text.pdf"))
+        print(make_two_column_pdf(out / "sample_two_column.pdf"))
     except ImportError:
-        print("reportlab not installed; skipped sample_text.pdf")
+        print("reportlab not installed; skipped sample_text.pdf and sample_two_column.pdf")
