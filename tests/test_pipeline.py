@@ -309,9 +309,10 @@ class FakeProc:
         pass
 
 
-def _fake_free_memory(monkeypatch, mb):
+def _fake_free_memory(monkeypatch, mb, cgroup_mb=None):
     fake = SimpleNamespace(virtual_memory=lambda: SimpleNamespace(available=mb * 2**20))
     monkeypatch.setattr(app, "psutil", fake)
+    monkeypatch.setattr(app, "_cgroup_available_mb", lambda: cgroup_mb)
 
 
 def test_schedule_depends_on_free_memory(monkeypatch):
@@ -338,8 +339,9 @@ def pipeline_spy(monkeypatch, tmp_path):
         events.append("extract_done")
         return [page(1, [[line("Recovered text.")]])]
 
-    def start(src, dst, opts, jobs, log):
+    def start(src, dst, opts, jobs, log, mode=None):
         events.append(("ocrmypdf_start", jobs))
+        events.append(("mode", mode))
         return FakeProc()
 
     def finish(*_):
@@ -349,26 +351,35 @@ def pipeline_spy(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "extract_pdf_pages", extract)
     monkeypatch.setattr(app, "start_ocrmypdf", start)
     monkeypatch.setattr(app, "finish_ocrmypdf", finish)
+    monkeypatch.setattr(app, "pdf_text_chars", lambda *_: 1000)  # the fake output "has" a text layer
+    monkeypatch.setattr(app.os, "cpu_count", lambda: 8)
     src = tmp_path / "in.pdf"
     src.write_bytes(b"%PDF-1.4")
     return SimpleNamespace(events=events, src=src, workdir=tmp_path)
 
 
 def test_sequential_mode_extracts_before_ocrmypdf(monkeypatch, pipeline_spy):
-    _fake_free_memory(monkeypatch, 500)
-    monkeypatch.setattr(app.os, "cpu_count", lambda: 8)
+    _fake_free_memory(monkeypatch, 4000, cgroup_mb=1000)  # the container limit is what counts
     res = app.convert(pipeline_spy.src, pipeline_spy.workdir, app.Options(),
                       on_markdown=lambda md: pipeline_spy.events.append("markdown_ready"))
-    # Extraction completes (and the Markdown is handed over) before OCRmyPDF starts; each gets all cores.
-    assert pipeline_spy.events == [("extract_start", 8), "extract_done", "markdown_ready",
-                                   ("ocrmypdf_start", 8), "ocrmypdf_done"]
+    # Extraction completes (and the Markdown is handed over) before OCRmyPDF starts. 1000 MB free * 0.75
+    # only fits 3 workers of ~218 MB at 300 DPI, not the 8 "cores" a container reports.
+    assert pipeline_spy.events == [("extract_start", 3), "extract_done", "markdown_ready",
+                                   ("ocrmypdf_start", 2), ("mode", "--redo-ocr"), "ocrmypdf_done"]
     assert res.stats["schedule"] == "sequential" and res.pdf_bytes == b"%PDF-fake"
+    assert res.stats["searchable PDF"] == "--redo-ocr"
+
+
+def test_sequential_mode_with_plenty_of_memory_uses_every_core(monkeypatch, pipeline_spy):
+    _fake_free_memory(monkeypatch, 64000)
+    app.convert(pipeline_spy.src, pipeline_spy.workdir, app.Options(force_sequential=True))
+    assert ("extract_start", 8) in pipeline_spy.events and ("ocrmypdf_start", 8) in pipeline_spy.events
 
 
 def test_concurrent_mode_overlaps_the_stages(monkeypatch, pipeline_spy):
     _fake_free_memory(monkeypatch, 8000)
     res = app.convert(pipeline_spy.src, pipeline_spy.workdir, app.Options())
-    assert pipeline_spy.events[:2] == [("ocrmypdf_start", app._worker_split()[1]), ("extract_start", None)]
+    assert [e[0] for e in pipeline_spy.events[:3]] == ["ocrmypdf_start", "mode", "extract_start"]
     assert res.stats["schedule"] == "concurrent" and res.pdf_bytes == b"%PDF-fake"
 
 
@@ -376,7 +387,7 @@ def test_concurrent_mode_overlaps_the_stages(monkeypatch, pipeline_spy):
 def test_ocrmypdf_failure_in_sequential_mode_keeps_the_markdown(monkeypatch, pipeline_spy, failing_stage):
     _fake_free_memory(monkeypatch, 500)
 
-    def fail(*_):
+    def fail(*_, **__):
         if failing_stage == "finish_ocrmypdf":
             raise app.PipelineError("OCRmyPDF was killed by the system")
         raise OSError("cannot allocate memory")
@@ -385,4 +396,141 @@ def test_ocrmypdf_failure_in_sequential_mode_keeps_the_markdown(monkeypatch, pip
     res = app.convert(pipeline_spy.src, pipeline_spy.workdir, app.Options())
     assert res.markdown.strip() == "Recovered text."
     assert res.pdf_bytes is None
-    assert any("OCRmyPDF" in w for w in res.warnings)
+    assert any(w.startswith(app.PDF_FAILED) and "OCRmyPDF" in w for w in res.warnings)
+
+
+# ---------------------------------------------------------------- hidden text layers / OCRmyPDF modes
+
+def _info(page_chars, has_fonts=True):
+    return app.PdfInfo(len(page_chars), [(612.0, 792.0)] * len(page_chars), has_fonts, sum(page_chars),
+                       page_chars)
+
+
+def test_ocrmypdf_mode_selection():
+    opts = app.Options()
+    hidden = _info([0, 0, 0])  # fonts referenced, nothing extractable (Google Docs export of scans)
+    assert hidden.image_only and hidden.hidden_text_layer
+    assert app.ocrmypdf_modes(hidden, opts) == ["--redo-ocr", "--force-ocr"]  # never --skip-text
+    assert app.ocrmypdf_modes(_info([0, 0], has_fonts=False), opts) == ["--redo-ocr", "--force-ocr"]
+    mixed = _info([900, 0, 800])  # real text, but one page has none
+    assert not mixed.image_only and mixed.pages_without_text == 1
+    assert app.ocrmypdf_modes(mixed, opts) == ["--redo-ocr", "--force-ocr"]
+    assert app.ocrmypdf_modes(_info([900, 800]), opts) == ["--skip-text"]
+    assert app.ocrmypdf_modes(hidden, app.Options(force_ocr=True)) == ["--force-ocr"]
+
+
+class Exit:
+    def __init__(self, code):
+        self.code = code
+
+
+@pytest.fixture
+def ocrmypdf_spy(monkeypatch, tmp_path):
+    """Script OCRmyPDF's outcome per mode: Exit(code), or an int = text characters in its output."""
+    calls, script = [], {}
+
+    def start(src, dst, opts, jobs, log, mode=None):
+        calls.append(mode)
+        return SimpleNamespace(mode=mode, poll=lambda: 0, kill=lambda: None, wait=lambda: None)
+
+    def finish(proc, dst, log, progress, start_frac):
+        outcome = script[proc.mode]
+        if isinstance(outcome, Exit):
+            outcome = outcome.code
+            log_text = "PriorOcrFoundError: page 1 already has text!" if outcome == app.EXIT_PRIOR_OCR else ""
+            raise app.OcrmypdfError(f"OCRmyPDF failed: exit {outcome}", outcome, log_text)
+        texts[dst] = outcome
+        return b"%PDF-" + proc.mode.encode()
+
+    texts = {}
+    monkeypatch.setattr(app, "start_ocrmypdf", start)
+    monkeypatch.setattr(app, "finish_ocrmypdf", finish)
+    monkeypatch.setattr(app, "pdf_text_chars", lambda path, tools: texts.get(path, 0))
+    tools = dict.fromkeys(("ocrmypdf", "tesseract", "ghostscript"), "x")
+
+    def run(modes, expect_text=True, fallback=None):
+        warnings = []
+        job = app._make_searchable(tmp_path / "in.pdf", tmp_path, app.Options(), tools, warnings, mode=modes[0])
+        data, outcome = app._collect_searchable_pdf(job, modes, tmp_path / "in.pdf", tmp_path, app.Options(),
+                                                    tools, warnings, lambda *_: None, 0.5,
+                                                    fallback=fallback, expect_text=expect_text)
+        return data, outcome, warnings
+
+    return SimpleNamespace(calls=calls, script=script, run=run)
+
+
+def test_prior_ocr_found_error_is_retried_with_the_next_mode(ocrmypdf_spy):
+    ocrmypdf_spy.script.update({"--redo-ocr": Exit(app.EXIT_PRIOR_OCR), "--force-ocr": 4210})
+    data, outcome, warnings = ocrmypdf_spy.run(["--redo-ocr", "--force-ocr"])
+    assert ocrmypdf_spy.calls == ["--redo-ocr", "--force-ocr"]
+    assert data == b"%PDF---force-ocr" and outcome == "--force-ocr" and warnings == []
+
+
+def test_run_that_adds_no_text_is_not_accepted(ocrmypdf_spy):
+    # The original bug: OCRmyPDF exits 0 but skipped every page, so the "searchable" PDF has no text.
+    ocrmypdf_spy.script.update({"--skip-text": 0, "--redo-ocr": 0, "--force-ocr": 4210})
+    data, outcome, _ = ocrmypdf_spy.run(["--skip-text", "--redo-ocr", "--force-ocr"])
+    assert ocrmypdf_spy.calls == ["--skip-text", "--redo-ocr", "--force-ocr"] and outcome == "--force-ocr"
+
+
+def test_all_modes_failing_is_a_soft_failure(ocrmypdf_spy):
+    ocrmypdf_spy.script.update({"--redo-ocr": Exit(2), "--force-ocr": 0})
+    data, outcome, warnings = ocrmypdf_spy.run(["--redo-ocr", "--force-ocr"])
+    assert data is None and outcome == "failed"
+    assert len(warnings) == 1 and warnings[0].startswith(app.PDF_FAILED + ": --redo-ocr: OCRmyPDF failed")
+    assert "--force-ocr: OCRmyPDF finished but added no text layer" in warnings[0]
+
+
+def test_fatal_ocrmypdf_errors_are_not_retried(ocrmypdf_spy):
+    ocrmypdf_spy.script.update({"--redo-ocr": Exit(9), "--force-ocr": 4210})  # 9 = missing language pack
+    data, outcome, warnings = ocrmypdf_spy.run(["--redo-ocr", "--force-ocr"])
+    assert ocrmypdf_spy.calls == ["--redo-ocr"] and data is None and warnings
+
+
+def test_resource_plan_caps_workers_and_lowers_dpi(monkeypatch):
+    info = _info([0] * 87)
+    _fake_free_memory(monkeypatch, 32000, cgroup_mb=1000)  # big host, small container
+    monkeypatch.setattr(app.os, "cpu_count", lambda: 16)
+    plan = app.plan_resources(info, app.Options())
+    assert plan.schedule == "sequential" and plan.dpi == 300
+    assert plan.ocr_workers == 3 and plan.ocrmypdf_jobs == 2 and plan.est_peak_mb <= 1000 * 0.75
+    _fake_free_memory(monkeypatch, 32000, cgroup_mb=250)  # not even one 300-DPI worker fits
+    plan = app.plan_resources(info, app.Options())
+    assert plan.dpi == app.LOW_MEMORY_DPI and plan.ocr_workers == 1
+
+
+# ---------------------------------------------------------------- regression: Nutrition_Book_ch04.pdf
+
+FIXTURES = Path(__file__).parent / "fixtures"
+# Local-only (git-ignored) test documents; the tests below skip when they're absent.
+CH04_SLICE = FIXTURES / "nutrition_ch04_p1-3.pdf"  # first 3 pages of Nutrition_Book_ch04.pdf
+CH04_FULL = FIXTURES / "Nutrition_Book_ch04.pdf"  # the full 87-page, 22 MB file
+
+
+@pytest.mark.skipif(not CH04_SLICE.exists(), reason=f"{CH04_SLICE.name} not present (local-only fixture)")
+def test_hidden_font_layer_is_detected_as_image_only():
+    info = app.analyze_pdf(CH04_SLICE, TOOLS)
+    assert info.has_fonts and info.text_chars == 0 and info.page_chars == [0, 0, 0]
+    assert info.image_only and info.hidden_text_layer
+    assert app.ocrmypdf_modes(info, app.Options())[0] == "--redo-ocr"
+
+
+@pytest.mark.skipif(not HAS_OCR, reason="Tesseract/Poppler not installed")
+@pytest.mark.parametrize("path", [CH04_SLICE, CH04_FULL], ids=["slice", "full"])
+def test_hidden_font_layer_pdf_converts_end_to_end(tmp_path, path):
+    if not path.exists():
+        pytest.skip(f"{path.name} not present")
+    res = app.convert(path, tmp_path, app.Options(make_pdf=bool(HAS_OCRMYPDF)))
+    assert res.stats["text layer"].startswith("hidden")
+    assert sum(c.isalpha() for c in res.markdown) > 1000 * res.stats["pages"]  # real text on every page
+    assert "Human Digestion and Absorption" in res.markdown
+    if HAS_OCRMYPDF:
+        # Either a genuinely searchable PDF, or a soft failure with a clear warning - never a crash and
+        # never the old silent pass-through of an unsearchable file.
+        if res.pdf_bytes:
+            out = tmp_path / "out.pdf"
+            out.write_bytes(res.pdf_bytes)
+            assert app.pdf_text_chars(out, TOOLS) > 1000 * res.stats["pages"]
+            assert res.stats["searchable PDF"] in ("--redo-ocr", "--force-ocr")
+        else:
+            assert any(w.startswith(app.PDF_FAILED) for w in res.warnings)

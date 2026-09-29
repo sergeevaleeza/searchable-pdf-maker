@@ -3,7 +3,23 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] - 2026-09-22
+## [Unreleased] - 2026-09-28
+
+### Fixed
+
+- Image-only PDFs with a hidden text layer now get a searchable PDF that really is searchable. Before, the "searchable PDF" had no text at all, although the Markdown was fine. Google Docs exports of scanned pages, for example, draw an invisible space in ArialMT for each empty paragraph. OCRmyPDF read that as "page already has text", skipped every page under `--skip-text`, exited successfully, and returned the file unchanged (its default mode stops with `PriorOcrFoundError` instead). Image-only files and pages now use `ocrmypdf --redo-ocr`, retrying with `--force-ocr` if that fails, and the output is checked for real text before it's offered. On the 87-page chapter that exposed this, the output went from 0 to 125,004 characters of text, with the pages pixel-identical to the original.
+- Large, image-heavy PDFs no longer risk running out of memory in containers. Pages are rendered one at a time to temporary files that Tesseract reads directly, so no page image is held in memory. The number of OCR workers and OCRmyPDF jobs is now limited by free memory as well as CPU cores, and free memory respects a container's cgroup limit rather than the host's RAM. If not even one page fits at the chosen DPI, OCR drops to 200 DPI with a warning. With a simulated 1 GB limit, the 87-page file peaked at 0.58 GB.
+- A searchable PDF that can't be produced no longer affects the rest of the result. You get the Markdown plus one warning: "Searchable PDF could not be generated for this file: …".
+- Word files that contain only scanned images get the same OCRmyPDF handling, because they were affected by the same problem.
+
+### Changed
+
+- Text is now counted page by page. A PDF that has text on most pages but none on some uses `--redo-ocr`, so those pages are OCR'd too.
+- New **Text layer** value `hidden/empty (fonts, no extractable text)` and a **Searchable PDF** metric showing which OCRmyPDF mode worked.
+- Every conversion logs a one-line pre-flight profile (pages, size, fonts versus extractable text, hidden text layer, DPI, schedule, workers, OCRmyPDF modes, estimated peak memory, free memory). It also appears in a **Diagnostics** expander. Each stage logs its duration and peak memory, including helper processes, and a failing stage logs its traceback with the file and page.
+- Tests: regression tests on the chapter that exposed the bug, which run when its PDF is present locally in `tests/fixtures/` (test PDFs are not uploaded), and unit tests for OCRmyPDF mode choice, `PriorOcrFoundError` retry, rejecting output with no text, fatal errors, and memory-limited worker planning.
+
+## [0.2.0] - 2026-09-22
 
 ### Fixed
 

@@ -5,3 +5,6 @@ venv/
 .pytest_cache/
 samples/
 out/
+
+# Test documents stay local (not uploaded): see README "Tests"
+tests/fixtures/*.pdf

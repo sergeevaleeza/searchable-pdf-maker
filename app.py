@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import contextlib
+import dataclasses
 import functools
 import glob
 import hashlib
@@ -24,6 +26,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -214,10 +217,26 @@ class PdfInfo:
     page_sizes: list[tuple[float, float]]  # points
     has_fonts: bool
     text_chars: int
+    page_chars: list[int] = field(default_factory=list)  # extractable alphanumerics per page, if known
 
     @property
     def image_only(self) -> bool:
+        """No usable text layer. Font references alone don't count: see hidden_text_layer."""
         return not self.has_fonts or self.text_chars < max(20, 2 * self.pages)
+
+    @property
+    def hidden_text_layer(self) -> bool:
+        """Fonts and text-drawing operators exist, but (almost) nothing is extractable.
+
+        Google Docs exports of scanned pages, for example, draw a lone space glyph in ArialMT for each
+        empty paragraph. Text extraction finds nothing, but OCRmyPDF counts it as "page already has
+        text", so these files must be treated as image-only everywhere, including the OCRmyPDF mode.
+        """
+        return self.has_fonts and self.image_only
+
+    @property
+    def pages_without_text(self) -> int:
+        return sum(1 for c in self.page_chars if c < MIN_TEXT_CHARS_PER_PAGE)
 
 
 def analyze_pdf(path: Path, tools: dict) -> PdfInfo:
@@ -240,7 +259,7 @@ def analyze_pdf(path: Path, tools: dict) -> PdfInfo:
     if not sizes:
         raise PipelineError("The PDF has no pages.")
 
-    has_fonts = text_chars = None
+    has_fonts = page_chars = None
     if tools.get("pdffonts"):
         try:
             out = _run([tools["pdffonts"], str(path)], timeout=180).stdout.splitlines()
@@ -252,19 +271,29 @@ def analyze_pdf(path: Path, tools: dict) -> PdfInfo:
     if tools.get("pdftotext"):
         try:
             out = _run([tools["pdftotext"], "-q", "-enc", "UTF-8", str(path), "-"], timeout=300).stdout
-            text_chars = sum(c.isalnum() for c in out)
+            per_page = out.split("\f")  # pdftotext ends every page with a form feed
+            page_chars = [sum(c.isalnum() for c in t) for t in per_page[:len(sizes)]]
+            page_chars += [0] * (len(sizes) - len(page_chars))
         except Exception:
             pass
     if has_fonts is None:
         has_fonts = any(_page_has_fonts(p) for p in reader.pages)
-    if text_chars is None:
-        text_chars = 0
+    if page_chars is None:
+        page_chars = []
         for p in reader.pages:
             try:
-                text_chars += sum(c.isalnum() for c in (p.extract_text() or ""))
+                page_chars.append(sum(c.isalnum() for c in (p.extract_text() or "")))
             except Exception:
-                pass
-    return PdfInfo(len(sizes), sizes, bool(has_fonts), text_chars)
+                page_chars.append(0)
+    return PdfInfo(len(sizes), sizes, bool(has_fonts), sum(page_chars), page_chars)
+
+
+def pdf_text_chars(path: Path, tools: dict) -> int:
+    """Extractable alphanumerics in a PDF: used to verify that a "searchable" PDF really is searchable."""
+    try:
+        return analyze_pdf(path, {"pdftotext": tools.get("pdftotext")}).text_chars
+    except PipelineError:
+        return 0
 
 
 def _page_has_fonts(page) -> bool:
@@ -318,16 +347,22 @@ def ocr_page(pdf_path: Path, page_no: int, page_size: tuple[float, float], opts:
     if pixels > MAX_PAGE_PIXELS:
         dpi = max(72, int(dpi * (MAX_PAGE_PIXELS / pixels) ** 0.5))
 
-    images = convert_from_path(str(pdf_path), dpi=dpi, first_page=page_no, last_page=page_no,
-                               fmt="png", grayscale=True, thread_count=1)
-    if not images:
-        raise RuntimeError("page could not be rendered")
-    img = images[0]
+    from PIL import Image
+
+    # Exactly one page is rendered (pdftoppm -f/-l) to a temp PNG, and Tesseract reads that file
+    # itself, so the bitmap (~8 MB grey at 300 DPI) is never held in Python; each worker's memory is
+    # released as soon as its page is done.
+    with tempfile.TemporaryDirectory(prefix="spm_page_") as tmp:
+        paths = convert_from_path(str(pdf_path), dpi=dpi, first_page=page_no, last_page=page_no, fmt="png",
+                                  grayscale=True, thread_count=1, output_folder=tmp, paths_only=True)
+        if not paths:
+            raise RuntimeError("page could not be rendered")
+        with Image.open(paths[0]) as img:  # reads the header only
+            width, height = img.size
+        data = pytesseract.image_to_data(str(paths[0]), lang=opts.lang, config="--psm 3",
+                                         output_type=pytesseract.Output.DICT, timeout=600)
     scale = 72.0 / dpi  # pixels -> points, so pages rendered at different DPIs stay comparable
-    data = pytesseract.image_to_data(img, lang=opts.lang, config="--psm 3",
-                                     output_type=pytesseract.Output.DICT, timeout=600)
-    page = PageContent(page_no, img.width * scale, img.height * scale, "ocr")
-    img.close()
+    page = PageContent(page_no, width * scale, height * scale, "ocr")
 
     lines: dict[tuple, list[dict]] = {}
     for i, text in enumerate(data["text"]):
@@ -1088,17 +1123,48 @@ def docx_to_markdown(path: Path) -> str:
 # Searchable PDF (OCRmyPDF)
 # --------------------------------------------------------------------------------------
 
+EXIT_PRIOR_OCR = 6  # ocrmypdf.ExitCode.already_done_ocr, i.e. PriorOcrFoundError
 OCRMYPDF_EXIT = {
     1: "bad arguments", 2: "the input file is not a valid PDF", 3: "a required program is missing "
     "(Tesseract or Ghostscript)", 4: "the output PDF failed validation", 5: "a file could not be read or "
-    "written", 7: "an OCR subprocess failed", 8: "the PDF is encrypted", 9: "invalid configuration "
-    "(is the Tesseract language pack installed?)", 15: "an unexpected internal error",
+    "written", EXIT_PRIOR_OCR: "a page already has text (PriorOcrFoundError)", 7: "an OCR subprocess failed",
+    8: "the PDF is encrypted", 9: "invalid configuration (is the Tesseract language pack installed?)",
+    15: "an unexpected internal error",
 }
+OCRMYPDF_FATAL_EXITS = {3, 8, 9}  # retrying with another mode can't help
 
 
-def start_ocrmypdf(src: Path, dst: Path, opts: Options, jobs: int, log: Path) -> subprocess.Popen:
+class OcrmypdfError(PipelineError):
+    """OCRmyPDF exited unsuccessfully. `prior_ocr` = it refused because a page already has text."""
+
+    def __init__(self, message: str, returncode: int, log_text: str = ""):
+        super().__init__(message)
+        self.returncode = returncode
+        self.prior_ocr = returncode == EXIT_PRIOR_OCR or "PriorOcrFoundError" in log_text
+        self.killed = returncode < 0 or returncode == 137
+        self.retryable = not self.killed and returncode not in OCRMYPDF_FATAL_EXITS
+
+
+def ocrmypdf_modes(info: PdfInfo, opts: Options) -> list[str]:
+    """OCRmyPDF page-handling flags to try, in order, for a PDF described by `info`."""
+    if opts.force_ocr:
+        return ["--force-ocr"]
+    if info.image_only or info.pages_without_text:
+        # Never --skip-text here. OCRmyPDF treats any text-drawing operator as "page already has text"
+        # (even one invisible space glyph, which Google Docs exports put on every page), so it skips
+        # every page, exits 0 and returns the file unchanged: a "searchable PDF" with no text. The
+        # default mode refuses such pages with PriorOcrFoundError instead. --redo-ocr OCRs every page
+        # while keeping real text; --force-ocr (rasterises the pages) is the fallback if it errors.
+        return ["--redo-ocr", "--force-ocr"]
+    return ["--skip-text"]  # every page has real text: OCR only pages that have none
+
+
+def start_ocrmypdf(src: Path, dst: Path, opts: Options, jobs: int, log: Path,
+                   mode: str | None = None) -> subprocess.Popen:
+    """Run OCRmyPDF in the background. `mode` is its page-handling flag (see ocrmypdf_modes)."""
+    mode = mode or ("--force-ocr" if opts.force_ocr else "--skip-text")
     cmd = [sys.executable, "-m", "ocrmypdf", "--output-type", "pdf", "-l", opts.lang, "--jobs", str(jobs),
-           "--force-ocr" if opts.force_ocr else "--skip-text", str(src), str(dst)]
+           mode, str(src), str(dst)]
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=open(log, "w", encoding="utf-8"))
 
 
@@ -1113,12 +1179,13 @@ def finish_ocrmypdf(proc: subprocess.Popen, dst: Path, log: Path, progress: Prog
         proc.stderr.close()
     if proc.returncode in (0, 10) and dst.exists():
         return dst.read_bytes()
+    log_text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
     if proc.returncode < 0 or proc.returncode == 137:  # SIGKILL: almost always the out-of-memory killer
-        raise PipelineError("OCRmyPDF was killed by the system, most likely because it ran out of memory. "
-                            "Turn on 'Force sequential mode' or lower the OCR DPI.")
+        raise OcrmypdfError("OCRmyPDF was killed by the system, most likely because it ran out of memory. "
+                            "Turn on 'Force sequential mode' or lower the OCR DPI.", proc.returncode, log_text)
     reason = OCRMYPDF_EXIT.get(proc.returncode, f"exit code {proc.returncode}")
-    tail = log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-6:] if log.exists() else []
-    raise PipelineError(f"OCRmyPDF failed: {reason}.\n" + "\n".join(tail))
+    tail = log_text.strip().splitlines()[-6:]
+    raise OcrmypdfError(f"OCRmyPDF failed: {reason}.\n" + "\n".join(tail), proc.returncode, log_text)
 
 
 # --------------------------------------------------------------------------------------
@@ -1135,23 +1202,156 @@ def _worker_split() -> tuple[int, int]:
     return max(1, cpus - ocrmypdf_jobs), ocrmypdf_jobs
 
 
+def _cgroup_available_mb() -> float | None:
+    """Memory left under a Linux container's cgroup limit, or None if there's no limit / not Linux.
+
+    Inside a container psutil reports the *host's* free RAM, which can be many GB more than the
+    container may use (Streamlit Community Cloud), so the cgroup limit has to be checked as well.
+    """
+    for limit_file, usage_file in (("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+                                   ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                                    "/sys/fs/cgroup/memory/memory.usage_in_bytes")):
+        try:
+            with open(limit_file) as fh:
+                limit = fh.read().strip()
+            with open(usage_file) as fh:
+                usage = int(fh.read().strip())
+        except (OSError, ValueError):
+            continue
+        if limit == "max" or int(limit) >= 1 << 60:  # "unlimited"
+            return None
+        return max(0.0, (int(limit) - usage) / 2**20)
+    return None
+
+
+def available_memory_mb() -> float | None:
+    """Free RAM this process may use: psutil's figure capped by any container limit (None = unknown)."""
+    values = []
+    if psutil is not None:
+        try:
+            values.append(psutil.virtual_memory().available / 2**20)
+        except Exception:
+            pass
+    cgroup = _cgroup_available_mb()
+    if cgroup is not None:
+        values.append(cgroup)
+    return min(values) if values else None
+
+
 def choose_schedule(opts: Options) -> tuple[str, str]:
     """Decide whether Tesseract (Markdown) and OCRmyPDF (PDF) may run at the same time.
 
-    Returns ("concurrent" | "sequential", reason). Concurrent only when psutil reports at least
-    opts.min_concurrent_mem_mb of free RAM; anything uncertain falls back to the safe sequential mode.
+    Returns ("concurrent" | "sequential", reason). Concurrent only when psutil (capped by any container
+    limit) reports at least opts.min_concurrent_mem_mb of free RAM; anything uncertain is sequential.
     """
     if opts.force_sequential:
         return "sequential", "forced by setting"
     if psutil is None:
         return "sequential", "psutil is not installed, so free memory is unknown"
-    try:
-        available_mb = psutil.virtual_memory().available / 2**20
-    except Exception:
+    available_mb = available_memory_mb()
+    if available_mb is None:
         return "sequential", "free memory could not be read"
     if available_mb >= opts.min_concurrent_mem_mb:
         return "concurrent", f"{available_mb:,.0f} MB free (threshold {opts.min_concurrent_mem_mb:,} MB)"
     return "sequential", f"only {available_mb:,.0f} MB free (threshold {opts.min_concurrent_mem_mb:,} MB)"
+
+
+# Memory model, measured on letter pages at 300/200 DPI: one OCR worker (pdftoppm + Tesseract) peaks at
+# ~100 MB plus ~14 MB per rendered megapixel (≈215 MB at 300 DPI, ≈150 MB at 200 DPI). An OCRmyPDF job
+# costs about the same, plus ~130 MB for OCRmyPDF itself. Worker counts are capped so the estimate fits.
+WORKER_BASE_MB = 100
+WORKER_MB_PER_MPIXEL = 14
+OCRMYPDF_BASE_MB = 130
+MEMORY_HEADROOM = 0.75  # plan to use at most this share of the free memory
+LOW_MEMORY_DPI = 200  # used instead of the chosen DPI when not even one worker fits in memory
+
+
+def worker_mb(page_size: tuple[float, float], dpi: int) -> float:
+    """Estimated peak memory of one OCR worker (or OCRmyPDF job) for a page of this size."""
+    pixels = min(page_size[0] / 72 * dpi * page_size[1] / 72 * dpi, MAX_PAGE_PIXELS)
+    return WORKER_BASE_MB + WORKER_MB_PER_MPIXEL * pixels / 1e6
+
+
+@dataclass
+class ResourcePlan:
+    schedule: str  # "concurrent" | "sequential"
+    reason: str
+    dpi: int
+    ocr_workers: int
+    ocrmypdf_jobs: int
+    est_peak_mb: int
+    available_mb: float | None
+
+
+def plan_resources(info: PdfInfo, opts: Options) -> ResourcePlan:
+    """Pick the schedule, the OCR DPI and how many workers each stage may run within free memory.
+
+    CPU counts inside containers report the host's cores, so without the memory cap a 1 GB container
+    on an 8-core host would start 8 Tesseract workers (~1.7 GB) even in sequential mode.
+    """
+    schedule, reason = choose_schedule(opts)
+    cpus = os.cpu_count() or 1
+    ocr_workers, jobs = _worker_split() if schedule == "concurrent" else (cpus, cpus)
+    largest = max(info.page_sizes, key=lambda s: s[0] * s[1])
+    dpi = opts.dpi
+    per_worker = worker_mb(largest, dpi)
+    available = available_memory_mb()
+    if available is not None:
+        budget = available * MEMORY_HEADROOM / (2 if schedule == "concurrent" else 1)
+        if per_worker > budget and dpi > LOW_MEMORY_DPI:
+            dpi, per_worker = LOW_MEMORY_DPI, worker_mb(largest, LOW_MEMORY_DPI)
+        ocr_workers = max(1, min(ocr_workers, int(budget // per_worker)))
+        jobs = max(1, min(jobs, int((budget - OCRMYPDF_BASE_MB) // per_worker)))
+    ocr_peak = ocr_workers * per_worker
+    pdf_peak = (OCRMYPDF_BASE_MB + jobs * per_worker) if opts.make_pdf else 0
+    peak = ocr_peak + pdf_peak if schedule == "concurrent" else max(ocr_peak, pdf_peak)
+    return ResourcePlan(schedule, reason, dpi, ocr_workers, jobs, int(peak), available)
+
+
+class _PeakRss:
+    """Samples the RSS of this process plus all its children (Tesseract, pdftoppm, OCRmyPDF...)."""
+
+    def __init__(self, interval: float = 0.25):
+        self.peak, self._stop = 0, threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(interval,), daemon=True)
+        self._thread.start()
+
+    def _run(self, interval: float) -> None:
+        try:  # diagnostics only: must never be able to break the pipeline
+            me = psutil.Process()
+            while not self._stop.is_set():
+                total = 0
+                for proc in [me] + me.children(recursive=True):
+                    try:
+                        total += proc.memory_info().rss
+                    except Exception:  # the child exited between listing and reading
+                        pass
+                self.peak = max(self.peak, total)
+                self._stop.wait(interval)
+        except Exception:
+            pass
+
+    def stop(self) -> float:
+        self._stop.set()
+        self._thread.join()
+        return self.peak / 2**20
+
+
+@contextlib.contextmanager
+def _stage(name: str, **context):
+    """Log a pipeline stage's duration and peak memory; on failure log its traceback and context."""
+    where = " ".join(f"{k}={v}" for k, v in context.items())
+    sampler = _PeakRss() if psutil is not None else None
+    t0 = time.time()
+    try:
+        yield
+    except BaseException:
+        log.exception("stage '%s' FAILED (%s)", name, where)
+        raise
+    finally:
+        peak = sampler.stop() if sampler else None
+        log.info("stage '%s' %.1fs, peak RSS %s (%s)", name, time.time() - t0,
+                 f"{peak:.0f} MB" if peak is not None else "n/a", where)
 
 
 def extract_pdf_pages(src: Path, info: PdfInfo, opts: Options, tools: dict, progress: ProgressFn,
@@ -1204,6 +1404,7 @@ def extract_pdf_pages(src: Path, info: PdfInfo, opts: Options, tools: dict, prog
                     try:
                         pages[n] = fut.result()
                     except Exception as exc:
+                        log.warning("render+OCR failed: file=%s page=%d", src.name, n, exc_info=exc)
                         if "tesseract" in type(exc).__name__.lower() and "language" in str(exc).lower():
                             raise PipelineError(f"Tesseract language data missing for '{opts.lang}': {exc}")
                         warnings.append(f"Page {n}: OCR failed ({str(exc).strip()[:200]}).")
@@ -1236,39 +1437,79 @@ def convert(src: Path, workdir: Path, opts: Options, progress: ProgressFn = _noo
     return result
 
 
+PDF_FAILED = "Searchable PDF could not be generated for this file"
+
+
 def _make_searchable(pdf: Path, workdir: Path, opts: Options, tools: dict, warnings: list[str],
-                     jobs: int | None = None):
+                     jobs: int | None = None, mode: str | None = None):
     """Start OCRmyPDF in the background; returns (proc, output, log) or None.
 
-    `jobs` = OCRmyPDF worker processes (default: its share of _worker_split).
+    `jobs` = OCRmyPDF worker processes (default: its share of _worker_split); `mode` = its page flag.
     """
     if not opts.make_pdf:
         return None
     missing = [t for t in ("ocrmypdf", "tesseract", "ghostscript") if not tools.get(t)]
     if missing:
-        warnings.append("Searchable PDF not created: " + " ".join(TOOL_HINTS[t] for t in missing))
+        warnings.append(f"{PDF_FAILED}: " + " ".join(TOOL_HINTS[t] for t in missing))
         return None
-    dst, log = workdir / "searchable.pdf", workdir / "ocrmypdf.log"
+    dst, log_path = workdir / "searchable.pdf", workdir / f"ocrmypdf{mode or ''}.log"
+    dst.unlink(missing_ok=True)  # never mistake a previous attempt's output for this one's
     try:
-        return start_ocrmypdf(pdf, dst, opts, jobs or _worker_split()[1], log), dst, log
+        return start_ocrmypdf(pdf, dst, opts, jobs or _worker_split()[1], log_path, mode=mode), dst, log_path
     except Exception as exc:  # e.g. OSError/MemoryError when forking: lose the PDF, never the Markdown
-        warnings.append(f"Searchable PDF not created: OCRmyPDF could not be started ({exc}).")
+        warnings.append(f"{PDF_FAILED}: OCRmyPDF could not be started ({exc}).")
         return None
 
 
-def _collect_pdf(job, fallback: Path | None, progress: ProgressFn, start: float, warnings: list[str]):
-    if job is None:
-        return fallback.read_bytes() if fallback else None
-    proc, dst, log = job
-    try:
-        return finish_ocrmypdf(proc, dst, log, progress, start)
-    except Exception as exc:  # any PDF-stage failure becomes a warning; the Markdown is already done
-        msg = str(exc) if isinstance(exc, PipelineError) else f"OCRmyPDF failed: {exc}"
-        if fallback:
-            warnings.append(f"{msg}\nFalling back to a PDF that already has a text layer.")
-            return fallback.read_bytes()
-        warnings.append(msg)
-        return None
+def _collect_searchable_pdf(job, modes: list[str], pdf: Path, workdir: Path, opts: Options, tools: dict,
+                            warnings: list[str], progress: ProgressFn, start: float,
+                            fallback: Path | None = None, expect_text: bool = False,
+                            jobs: int | None = None) -> tuple[bytes | None, str]:
+    """Await OCRmyPDF (`job` was started with modes[0]); on failure retry with the next mode.
+
+    Returns (PDF bytes or None, outcome). Never raises: every failure becomes one warning, so the
+    Markdown that's already been produced is never lost. With `expect_text`, a run that "succeeds"
+    without adding any text (OCRmyPDF skipped every page) counts as a failure too.
+    """
+    problems: list[str] = []
+    for attempt, mode in enumerate(modes):
+        if attempt:
+            log.warning("OCRmyPDF %s failed (%s); retrying with %s", modes[attempt - 1], problems[-1], mode)
+            progress(start, f"Retrying the searchable PDF with OCRmyPDF {mode}…")
+            job = _make_searchable(pdf, workdir, opts, tools, warnings, jobs=jobs, mode=mode)
+        if job is None:
+            break  # OCRmyPDF disabled, missing or not startable: _make_searchable said why
+        proc, dst, log_path = job
+        try:
+            with _stage(f"searchable PDF (ocrmypdf {mode})", file=pdf.name):
+                data = finish_ocrmypdf(proc, dst, log_path, progress, start)
+        except OcrmypdfError as exc:
+            problems.append(f"{mode}: {exc}".strip())
+            if exc.prior_ocr:
+                log.warning("OCRmyPDF %s: PriorOcrFoundError (a page already has text)", mode)
+            if not exc.retryable:
+                break
+            continue
+        except Exception as exc:
+            problems.append(f"{mode}: {type(exc).__name__}: {exc}")
+            continue
+        finally:
+            _kill(job)
+        if expect_text and pdf_text_chars(dst, tools) == 0:
+            problems.append(f"{mode}: OCRmyPDF finished but added no text layer")
+            continue
+        return data, mode
+
+    if not problems:  # nothing was attempted
+        return (fallback.read_bytes(), "original") if fallback else (None, "not created")
+    reason = "; ".join(p.splitlines()[0] for p in problems)
+    log.error("%s (%s): %s", PDF_FAILED, pdf.name, "\n".join(problems))
+    if fallback:
+        warnings.append(f"{PDF_FAILED}: {reason}. The original PDF already has a text layer, so it is "
+                        "offered instead.")
+        return fallback.read_bytes(), "original"
+    warnings.append(f"{PDF_FAILED}: {reason}")
+    return None, "failed"
 
 
 def _kill(job) -> None:
@@ -1282,7 +1523,8 @@ def _convert_pdf(src: Path, workdir: Path, opts: Options, progress: ProgressFn,
     tools = find_tools()
     warnings: list[str] = []
     progress(0.01, "Inspecting PDF…")
-    info = analyze_pdf(src, tools)
+    with _stage("detect text layer", file=src.name):
+        info = analyze_pdf(src, tools)
     ocr_all = opts.force_ocr or info.image_only
     if ocr_all:
         missing = [t for t in ("tesseract", "pdftoppm") if not tools.get(t)]
@@ -1291,36 +1533,55 @@ def _convert_pdf(src: Path, workdir: Path, opts: Options, progress: ProgressFn,
 
     # A PDF that already had text is itself searchable, so it is an acceptable fallback.
     fallback = src if opts.make_pdf and not info.image_only else None
-    mode, reason = choose_schedule(opts)
-    log.info("Schedule: %s (%s)", mode, reason)
-    progress(0.02, f"Schedule: {mode} ({reason})")
+    modes = ocrmypdf_modes(info, opts)
+    plan = plan_resources(info, opts)
+    mode = plan.schedule
+    if plan.dpi != opts.dpi:
+        warnings.append(f"Low memory: OCR resolution lowered from {opts.dpi} to {plan.dpi} DPI.")
+        opts = dataclasses.replace(opts, dpi=plan.dpi)
+    free = f"{plan.available_mb:,.0f}" if plan.available_mb is not None else "unknown"
+    preflight = (f"file={src.name} size={src.stat().st_size / 2**20:.1f}MB pages={info.pages} "
+                 f"fonts={info.has_fonts} text_chars={info.text_chars} pages_without_text={info.pages_without_text} "
+                 f"hidden_text_layer={info.hidden_text_layer} image_only={info.image_only} | dpi={plan.dpi} "
+                 f"schedule={mode} ocr_workers={plan.ocr_workers} ocrmypdf_jobs={plan.ocrmypdf_jobs} "
+                 f"ocrmypdf_modes={','.join(modes)} est_peak={plan.est_peak_mb}MB free={free}MB")
+    log.info("preflight: %s", preflight)
+    progress(0.02, f"Schedule: {mode} ({plan.reason})")
 
-    def markdown_stage(span: tuple[float, float], workers: int | None) -> tuple[list[PageContent], str]:
-        pages = extract_pdf_pages(src, info, opts, tools, progress, warnings, span=span, workers=workers)
+    def markdown_stage(span: tuple[float, float]) -> tuple[list[PageContent], str]:
+        with _stage("markdown extraction (text layer / render + OCR)", file=src.name, pages=info.pages,
+                    workers=plan.ocr_workers, dpi=opts.dpi):
+            pages = extract_pdf_pages(src, info, opts, tools, progress, warnings, span=span,
+                                      workers=plan.ocr_workers)
         progress(span[1], "Reconstructing Markdown structure…")
-        md = build_markdown(pages, opts.heading_ratio)
+        with _stage("build markdown", file=src.name):
+            md = build_markdown(pages, opts.heading_ratio)
         if on_markdown:
             on_markdown(md)
         return pages, md
 
+    def pdf_stage(job, start: float) -> tuple[bytes | None, str]:
+        return _collect_searchable_pdf(job, modes, src, workdir, opts, tools, warnings, progress, start,
+                                       fallback=fallback, expect_text=_has_alnum(markdown),
+                                       jobs=plan.ocrmypdf_jobs)
+
     if mode == "concurrent":
         # Plenty of RAM: OCRmyPDF builds the PDF in the background while we extract; cores are shared.
-        job = _make_searchable(src, workdir, opts, tools, warnings)
+        job = _make_searchable(src, workdir, opts, tools, warnings, jobs=plan.ocrmypdf_jobs, mode=modes[0])
         try:
-            pages, markdown = markdown_stage((0.0, 0.9), None)
-            pdf_bytes = _collect_pdf(job, fallback, progress, 0.92, warnings)
+            pages, markdown = markdown_stage((0.0, 0.9))
+            pdf_bytes, pdf_outcome = pdf_stage(job, 0.92)
         finally:
             _kill(job)
     else:
-        # Low RAM: one heavy stage at a time, each with every core. Markdown extraction ALWAYS runs
-        # first and to completion: it is the core output of the app, so if OCRmyPDF then exhausts memory
-        # and is killed at the very end, the user still has the finished Markdown. Never start OCRmyPDF
-        # before this point in sequential mode.
-        cpus = os.cpu_count() or 1
-        pages, markdown = markdown_stage((0.0, 0.5 if opts.make_pdf else 0.9), cpus)
-        job = _make_searchable(src, workdir, opts, tools, warnings, jobs=cpus)
+        # Low RAM: one heavy stage at a time. Markdown extraction ALWAYS runs first and to completion:
+        # it is the core output of the app, so if OCRmyPDF then exhausts memory and is killed at the very
+        # end, the user still has the finished Markdown. Never start OCRmyPDF before this point in
+        # sequential mode.
+        pages, markdown = markdown_stage((0.0, 0.5 if opts.make_pdf else 0.9))
+        job = _make_searchable(src, workdir, opts, tools, warnings, jobs=plan.ocrmypdf_jobs, mode=modes[0])
         try:
-            pdf_bytes = _collect_pdf(job, fallback, progress, 0.55, warnings)
+            pdf_bytes, pdf_outcome = pdf_stage(job, 0.55)
         finally:
             _kill(job)
 
@@ -1328,12 +1589,20 @@ def _convert_pdf(src: Path, workdir: Path, opts: Options, progress: ProgressFn,
     confs = [p.conf for p in ocr_pages if p.conf is not None]
     if not markdown.strip():
         warnings.append("No text could be recognised in this document.")
+    if info.hidden_text_layer:
+        layer = "hidden/empty (fonts, no extractable text)"
+    elif info.image_only:
+        layer = "none (image-only)"
+    else:
+        layer = f"partial ({info.pages_without_text} pages without)" if info.pages_without_text else "present"
     return Result(markdown, pdf_bytes, warnings, {
         "pages": info.pages,
-        "text layer": "none (image-only)" if info.image_only else "present",
+        "text layer": layer,
         "OCR pages": len(ocr_pages),
         "mean OCR confidence": round(sum(confs) / len(confs), 1) if confs else None,
         "schedule": mode,
+        "searchable PDF": pdf_outcome if opts.make_pdf else None,
+        "preflight": preflight,
     })
 
 
@@ -1358,22 +1627,29 @@ def _convert_word(src: Path, workdir: Path, opts: Options, progress: ProgressFn)
     elif opts.make_pdf or sum(c.isalnum() for c in markdown) < 20:
         progress(0.3, "Converting to PDF with LibreOffice…")
         pdf = soffice_convert(docx_path, workdir, "pdf", soffice)
-        stats["pages"] = analyze_pdf(pdf, tools).pages
+        info = analyze_pdf(pdf, tools)
+        stats["pages"] = info.pages
 
         if sum(c.isalnum() for c in markdown) < 20:
             # Word file that only contains scanned images: OCR the rendered PDF instead.
             warnings.append("The Word file contains little or no text; the Markdown was produced by OCR.")
-            info = analyze_pdf(pdf, tools)
             pages = extract_pdf_pages(pdf, info, Options(**{**opts.__dict__, "force_ocr": True}), tools,
-                                      progress, warnings, span=(0.35, 0.85))
+                                      progress, warnings, span=(0.35, 0.85),
+                                      workers=plan_resources(info, opts).ocr_workers)
             markdown = build_markdown(pages, opts.heading_ratio)
             stats["OCR pages"] = len(pages)
 
         if opts.make_pdf:
+            # Everything else is finished by now, so OCRmyPDF may use the whole (memory-capped) budget.
             progress(0.88, "Adding OCR text layer to any image-only pages…")
-            job = _make_searchable(pdf, workdir, Options(**{**opts.__dict__, "force_ocr": False}), tools, [])
+            pdf_opts = Options(**{**opts.__dict__, "force_ocr": False, "force_sequential": True})
+            modes = ocrmypdf_modes(info, pdf_opts)
+            jobs = plan_resources(info, pdf_opts).ocrmypdf_jobs
+            job = _make_searchable(pdf, workdir, pdf_opts, tools, [], jobs=jobs, mode=modes[0])
             try:
-                pdf_bytes = _collect_pdf(job, pdf, progress, 0.88, warnings)
+                pdf_bytes, stats["searchable PDF"] = _collect_searchable_pdf(
+                    job, modes, pdf, workdir, pdf_opts, tools, warnings, progress, 0.88, fallback=pdf,
+                    expect_text=_has_alnum(markdown), jobs=jobs)
             finally:
                 _kill(job)
     return Result(markdown, pdf_bytes, warnings, stats)
@@ -1391,9 +1667,20 @@ def _safe_name(name: str) -> str:
     return (re.sub(r"[^\w.-]+", "_", stem).strip("._") or "document") + ext.lower()
 
 
+def _setup_logging() -> None:
+    """Send this app's log lines (pre-flight profile, stages, failures) to stderr once per process."""
+    if not log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+        log.propagate = False
+
+
 def main() -> None:
     import streamlit as st
 
+    _setup_logging()
     st.set_page_config(page_title="Searchable PDF Maker", page_icon="📄", layout="wide")
     st.title("📄 Searchable PDF Maker")
     st.caption("Upload a PDF (including scanned, image-only PDFs) or a Word document. "
@@ -1405,7 +1692,9 @@ def main() -> None:
     with st.sidebar:
         st.header("Options")
         dpi = st.number_input("OCR DPI", min_value=100, max_value=600, value=300, step=50,
-                              help="Render resolution for OCR. 300 is a good default; raise it for tiny text.")
+                              help="Render resolution for OCR. 300 is a good default; raise it for tiny text, "
+                                   "use 200 on low-memory hosts. If even one page won't fit in free memory, "
+                                   f"the app drops to {LOW_MEMORY_DPI} automatically.")
         force_ocr = st.toggle("Force OCR even if a text layer exists", value=False,
                               help="Ignore any existing text and OCR every page. For the PDF output this "
                                    "rasterises pages (OCRmyPDF --force-ocr).")
@@ -1497,11 +1786,14 @@ def main() -> None:
     for w in result.warnings:
         st.warning(w)
 
-    stats = {k: v for k, v in result.stats.items() if v is not None}
+    stats = {k: v for k, v in result.stats.items() if v is not None and k != "preflight"}
     if stats:
         cols = st.columns(len(stats))
         for col, (k, v) in zip(cols, stats.items()):
             col.metric(k[:1].upper() + k[1:], f"{v}s" if k == "seconds" else v)
+    if result.stats.get("preflight"):
+        with st.expander("Diagnostics"):
+            st.code(result.stats["preflight"].replace(" | ", "\n").replace(" ", "\n"), language=None)
 
     c1, c2 = st.columns(2)
     c1.download_button("⬇️ Download Markdown (.md)", result.markdown.encode("utf-8"), file_name=f"{stem}.md",
@@ -1543,6 +1835,7 @@ def cli(argv: list[str]) -> int:
     ap.add_argument("--min-concurrent-mem-mb", type=int, default=MIN_CONCURRENT_MEM_MB,
                     help="free RAM needed to run both OCR stages at once (default %(default)s)")
     args = ap.parse_args(argv)
+    _setup_logging()
 
     opts = Options(args.dpi, args.force_ocr, args.lang, args.heading_ratio, not args.no_pdf,
                    args.sequential, args.min_concurrent_mem_mb)
